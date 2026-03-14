@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./get-meetups [--quiet] [--steps] [--agents FILE] [--output FILE]
+
+Options:
+  --quiet         Silent mode (no execution output)
+  --steps         Show Codex JSON event stream
+  --agents FILE   Instructions file (default: AGENTS.md)
+  --output FILE   Expected output file (default: events.md)
+EOF
+}
+
+QUIET=0
+STEPS=0
+AGENTS_FILE="AGENTS.md"
+OUTPUT_FILE="events.md"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --quiet)
+      QUIET=1
+      shift
+      ;;
+    --steps)
+      STEPS=1
+      shift
+      ;;
+    --agents)
+      AGENTS_FILE="${2:-}"
+      if [[ -z "$AGENTS_FILE" ]]; then
+        echo "Missing value for --agents" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --output)
+      OUTPUT_FILE="${2:-}"
+      if [[ -z "$OUTPUT_FILE" ]]; then
+        echo "Missing value for --output" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -f "$AGENTS_FILE" ]]; then
+  echo "Instructions file not found: $AGENTS_FILE" >&2
+  exit 1
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex CLI not found in PATH." >&2
+  exit 1
+fi
+
+log() {
+  if [[ "$QUIET" -eq 0 ]]; then
+    echo "$@"
+  fi
+}
+
+log "Running meetup extraction with codex exec..."
+log "Instructions: $AGENTS_FILE"
+log "Expected output: $OUTPUT_FILE"
+
+PROMPT=$'Read and execute the instructions file "'"$AGENTS_FILE"'" from this repository root.\nFollow it exactly and write the requested output file(s).'
+
+CODEX_ARGS=(exec --full-auto -C "$PWD")
+if [[ "$STEPS" -eq 1 ]]; then
+  CODEX_ARGS+=(--json)
+fi
+
+if [[ "$QUIET" -eq 1 ]]; then
+  codex "${CODEX_ARGS[@]}" "$PROMPT" >/dev/null 2>&1
+else
+  codex "${CODEX_ARGS[@]}" "$PROMPT"
+fi
+
+if [[ ! -s "$OUTPUT_FILE" ]]; then
+  echo "Expected output file not found or empty: $OUTPUT_FILE" >&2
+  exit 1
+fi
+
+log "Done: $OUTPUT_FILE"
