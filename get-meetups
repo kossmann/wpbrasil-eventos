@@ -4,95 +4,170 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./get-meetups [--quiet] [--steps] [--agents FILE] [--output FILE]
+  ./get-meetups [--quiet]
 
 Options:
-  --quiet         Silent mode (no execution output)
-  --steps         Show Codex JSON event stream
-  --agents FILE   Instructions file (default: AGENTS.md)
-  --output FILE   Expected output file (default: events.md)
+  --quiet   Silent mode (no execution output)
+
+Environment:
+  GET_MEETUPS_TIMEOUT  Max execution time in seconds (default: 420)
+  GET_MEETUPS_RETRIES  Retry attempts for transient codex failures (default: 3)
 EOF
 }
 
 QUIET=0
-STEPS=0
 AGENTS_FILE="AGENTS.md"
 OUTPUT_FILE="events.md"
+TIMEOUT_SECONDS="${GET_MEETUPS_TIMEOUT:-420}"
+RETRY_ATTEMPTS="${GET_MEETUPS_RETRIES:-3}"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --quiet)
-      QUIET=1
-      shift
-      ;;
-    --steps)
-      STEPS=1
-      shift
-      ;;
-    --agents)
-      AGENTS_FILE="${2:-}"
-      if [[ -z "$AGENTS_FILE" ]]; then
-        echo "Missing value for --agents" >&2
-        exit 1
-      fi
-      shift 2
-      ;;
-    --output)
-      OUTPUT_FILE="${2:-}"
-      if [[ -z "$OUTPUT_FILE" ]]; then
-        echo "Missing value for --output" >&2
-        exit 1
-      fi
-      shift 2
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
-done
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
-if [[ ! -f "$AGENTS_FILE" ]]; then
-  echo "Instructions file not found: $AGENTS_FILE" >&2
+if [[ "${1:-}" == "--quiet" ]]; then
+  QUIET=1
+elif [[ -n "${1:-}" ]]; then
+  echo "Unknown argument: $1" >&2
+  usage >&2
   exit 1
 fi
+
+[[ -f "$AGENTS_FILE" ]] || { echo "Missing $AGENTS_FILE" >&2; exit 1; }
+
+missing_dependencies=()
 
 if ! command -v codex >/dev/null 2>&1; then
-  echo "codex CLI not found in PATH." >&2
+  missing_dependencies+=("codex")
+fi
+
+if ! command -v agent-browser >/dev/null 2>&1; then
+  missing_dependencies+=("agent-browser")
+fi
+
+if [[ "${#missing_dependencies[@]}" -gt 0 ]]; then
+  printf 'Missing required command'
+  [[ "${#missing_dependencies[@]}" -gt 1 ]] && printf 's'
+  printf ': %s\n' "${missing_dependencies[*]}" >&2
+  echo "Install the missing tool(s) and rerun ./get-meetups." >&2
   exit 1
 fi
 
-log() {
-  if [[ "$QUIET" -eq 0 ]]; then
-    echo "$@"
+mkdir -p .runtime .tmp .agent-browser
+export XDG_RUNTIME_DIR="$PWD/.runtime"
+export TMPDIR="$PWD/.tmp"
+export AGENT_BROWSER_CONFIG="$PWD/agent-browser.json"
+export AGENT_BROWSER_SESSION="wpbrasil-eventos"
+
+PROMPT=$'Execute AGENTS.md in this repository.\nHard requirements:\n- Use agent-browser for Meetup pages.\n- Do NOT use web search, curl, or other fallbacks.\n- Use the local agent-browser config and local runtime directories already set in the environment.\n- If agent-browser is unavailable/blocked, stop immediately with a one-line error.\n- Keep actions minimal and finish quickly.\n- Print only short progress updates in this format: STEP: <message>\n- Do not print planning text, internal reasoning, or command explanations.\nWrite events.md.'
+CODEX_FLAGS=(exec --dangerously-bypass-approvals-and-sandbox -C "$PWD")
+
+backup_file="$(mktemp)"
+last_message_file="$(mktemp)"
+run_log_file="$(mktemp)"
+had_backup=0
+if [[ -f "$OUTPUT_FILE" ]]; then
+  cp "$OUTPUT_FILE" "$backup_file"
+  had_backup=1
+fi
+trap 'rm -f "$backup_file" "$last_message_file" "$run_log_file"' EXIT
+
+restore_backup() {
+  if [[ "$had_backup" -eq 1 ]]; then
+    cp "$backup_file" "$OUTPUT_FILE"
   fi
 }
 
-log "Running meetup extraction with codex exec..."
-log "Instructions: $AGENTS_FILE"
-log "Expected output: $OUTPUT_FILE"
+print_filtered_log() {
+  [[ -f "$run_log_file" ]] || return 0
+  sed -E \
+    -e '/^WARNING: failed to clean up stale arg0 temp dirs:/d' \
+    -e '/^WARNING: proceeding, even though we could not update PATH:/d' \
+    -e '/state db missing rollout path/d' \
+    -e '/^OpenAI Codex v/d' \
+    -e '/^--------$/d' \
+    -e '/^workdir: /d' \
+    -e '/^approval: /d' \
+    -e '/^sandbox: /d' \
+    -e '/^reasoning effort: /d' \
+    -e '/^reasoning summaries: /d' \
+    -e '/^session id: /d' \
+    -e '/^user$/d' \
+    -e '/^mcp startup: /d' \
+    -e '/^thinking$/d' \
+    -e '/^\*\*.*\*\*$/d' \
+    -e '/^exec$/d' \
+    -e '/^\/bin\/bash -lc /d' \
+    -e '/codex_core::codex: failed to record rollout items/d' \
+    -e '/Reconnecting\.\.\./d' \
+    -e '/^Warning: no last agent message;/d' \
+    -e '/^ERROR: Failed to shutdown rollout recorder/d' \
+    -e '/^Execute AGENTS\.md in this repository\.$/,/^Write events\.md\.$/d' \
+    "$run_log_file" | grep -E '^(model: |provider: |STEP: |Failed: |Done: |ERROR: )' || true
+}
 
-PROMPT=$'Read and execute the instructions file "'"$AGENTS_FILE"'" from this repository root.\nFollow it exactly and write the requested output file(s).'
+last_error_message=""
+attempt=1
+success=0
+while [[ "$attempt" -le "$RETRY_ATTEMPTS" ]]; do
+  : >"$last_message_file"
+  : >"$run_log_file"
+  exit_status=0
 
-CODEX_ARGS=(exec --full-auto -C "$PWD")
-if [[ "$STEPS" -eq 1 ]]; then
-  CODEX_ARGS+=(--json)
-fi
+  if [[ "$QUIET" -eq 1 ]]; then
+    if timeout "${TIMEOUT_SECONDS}s" codex "${CODEX_FLAGS[@]}" -o "$last_message_file" "$PROMPT" >/dev/null 2>&1; then
+      success=1
+      break
+    fi
+    exit_status=$?
+  else
+    if timeout "${TIMEOUT_SECONDS}s" codex "${CODEX_FLAGS[@]}" -o "$last_message_file" "$PROMPT" >"$run_log_file" 2>&1; then
+      print_filtered_log
+      success=1
+      break
+    fi
+    exit_status=$?
+    print_filtered_log
+  fi
 
-if [[ "$QUIET" -eq 1 ]]; then
-  codex "${CODEX_ARGS[@]}" "$PROMPT" >/dev/null 2>&1
-else
-  codex "${CODEX_ARGS[@]}" "$PROMPT"
-fi
+  if [[ "$exit_status" -eq 124 ]]; then
+    last_error_message="timed out after ${TIMEOUT_SECONDS}s"
+    break
+  fi
 
-if [[ ! -s "$OUTPUT_FILE" ]]; then
-  echo "Expected output file not found or empty: $OUTPUT_FILE" >&2
+  if grep -Eq 'ERROR: stream disconnected before completion|error sending request for url|connection reset|temporarily unavailable|timed out' "$run_log_file"; then
+    last_error_message="$(grep -E '^(ERROR: |Failed: )' "$run_log_file" | tail -n 1 || true)"
+    if [[ "$attempt" -lt "$RETRY_ATTEMPTS" ]]; then
+      [[ "$QUIET" -eq 1 ]] || echo "STEP: Retrying after transient codex failure (${attempt}/${RETRY_ATTEMPTS})."
+      attempt=$((attempt + 1))
+      sleep 2
+      continue
+    fi
+  fi
+
+  break
+done
+
+if [[ "$success" -ne 1 ]]; then
+  restore_backup
+  if [[ -n "$last_error_message" ]]; then
+    echo "Failed: ${last_error_message#ERROR: }" >&2
+  else
+    echo "Failed: codex execution error. See output above." >&2
+  fi
   exit 1
 fi
 
-log "Done: $OUTPUT_FILE"
+if [[ -s "$last_message_file" ]] && grep -Eq 'agent-browser is unavailable/blocked|Failed to bind socket|Operation not permitted' "$last_message_file"; then
+  restore_backup
+  echo "Failed: agent-browser unavailable/blocked in this environment." >&2
+  exit 1
+fi
+
+if [[ ! -s "$OUTPUT_FILE" ]]; then
+  restore_backup
+  echo "Expected output file not found or empty: $OUTPUT_FILE" >&2
+  exit 1
+fi
+[[ "$QUIET" -eq 1 ]] || echo "Done: $OUTPUT_FILE"

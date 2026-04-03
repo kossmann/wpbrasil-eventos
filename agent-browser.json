@@ -1,0 +1,7 @@
+{
+  "engine": "chrome",
+  "headed": false,
+  "args": "--no-sandbox,--disable-dev-shm-usage",
+  "maxOutput": 12000,
+  "contentBoundaries": false
+}
